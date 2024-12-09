@@ -3,7 +3,7 @@ import torch.distributed as dist
 from yunchang import UlyssesAttention
 
 from flash_attn import flash_attn_func
-from yunchang.kernels import FlashAttentionImpl
+from yunchang.kernels import FlashAttentionImpl, select_flash_attn_impl
 
 def log(msg, a, rank0_only=False):
     world_size = dist.get_world_size()
@@ -49,7 +49,6 @@ if __name__ == "__main__":
 
     assert seqlen % world_size == 0
     assert d % 8 == 0
-    # assert batch_size == 1
 
     q = torch.randn(
         batch_size, seqlen, nheads, d, device=device, dtype=dtype, requires_grad=True
@@ -68,18 +67,14 @@ if __name__ == "__main__":
     dist.broadcast(dout, src=0)
 
     local_q = q.chunk(world_size, dim=1)[rank].detach().clone()
-    local_q.requires_grad = True
     local_k = k.chunk(world_size, dim=1)[rank].detach().clone()
-    local_k.requires_grad = True
     local_v = v.chunk(world_size, dim=1)[rank].detach().clone()
-    local_v.requires_grad = True
 
     local_dout = dout.chunk(world_size, dim=1)[rank].detach().clone()
 
-    # prcess_group == sequence_process_group
     sp_pg = None #dist.new_group(ranks=[i for i in range(world_size)])
 
-    dist_attn = UlyssesAttention(sp_pg, attn_type=FlashAttentionImpl.FA)
+    dist_attn = UlyssesAttention(sp_pg, attn_type=FlashAttentionImpl.TORCH)
 
     if rank == 0:
         print("#" * 30)
@@ -99,21 +94,16 @@ if __name__ == "__main__":
         return_attn_probs=True,
     )
 
-    if rank == 0:
-        print("#" * 30)
-        print("# ds-ulysses backward:")
-        print("#" * 30)
-
-    local_out.backward(local_dout)
-
     dist.barrier()
 
     if rank == 0:
         print("#" * 30)
         print("# local forward:")
         print("#" * 30)
+
     # reference, a local flash attn
-    out_ref, _, _ = flash_attn_func(
+    local_attn_fn = select_flash_attn_impl(FlashAttentionImpl.TORCH, stage="fwd-bwd")
+    out_ref = local_attn_fn(
         q,
         k,
         v,
@@ -125,14 +115,13 @@ if __name__ == "__main__":
         deterministic=deterministic,
         return_attn_probs=True,
     )
+
+    dist.barrier()
+
     if rank == 0:
         print("#" * 30)
         print("# local forward:")
         print("#" * 30)
-
-    out_ref.backward(dout)
-
-    dist.barrier()
 
     # check correctness
 
@@ -140,15 +129,3 @@ if __name__ == "__main__":
 
     log("out", local_out, rank0_only=True)
     log("out diff", local_out_ref - local_out)
-
-    local_dq_ref = q.grad.chunk(world_size, dim=1)[rank]
-    log("load_dq", local_q.grad)
-    log("dq diff", local_dq_ref - local_q.grad)
-
-    local_dk_ref = k.grad.chunk(world_size, dim=1)[rank]
-    log("load_dk", local_k.grad)
-    log("dk diff", local_dk_ref - local_k.grad)
-
-    local_dv_ref = v.grad.chunk(world_size, dim=1)[rank]
-    log("load_dk", local_v.grad)
-    log("dv diff", local_dv_ref - local_v.grad)
